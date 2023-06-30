@@ -34,6 +34,7 @@ train_gt_images_dir in config.py stands for train data directory
 
 also change the path for test
 for Set5, search google and download it
+need to change in config.py
 test_gt_images_dir = f"../Ensemble-PyTorch-master/data/Set5/GTmod12"
 test_lr_images_dir = f"../Ensemble-PyTorch-master/data/Set5/LRbicx{upscale_factor}"
 
