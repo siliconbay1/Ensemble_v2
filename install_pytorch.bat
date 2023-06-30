@@ -10,7 +10,7 @@ call conda activate %venv%
 call conda install pytorch torchvision==0.13.0 torchaudio cudatoolkit=11.3 -c pytorch
 call conda install notebook ipykernel
 call python -m ipykernel install --user --name pytorch --display-name pytorch
-call pip install -r _requirements.txt
+call pip install -r requirements.txt
 call python train_srgan.py
 
 cmd /k
