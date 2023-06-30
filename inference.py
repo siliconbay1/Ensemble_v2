@@ -51,7 +51,7 @@ def build_model(device: torch.device) -> nn.Module:
     g_model = unet_model.__dict__["UNet"](config.in_channels, config.out_channels)
     
     espcn = espcn.to(device)
-    fsrcnn = espcn.to(device)
+    fsrcnn = fsrcnn.to(device)
     g_model = g_model.to(device)
 
     return espcn, fsrcnn, g_model
@@ -66,7 +66,7 @@ def main(args):
 
     # Load model weights
     espcn_model = load_state_dict(espcn_model, args.espcn_model_weights_path)
-    fsrcnn_model = load_state_dict(espcn_model, args.fsrcnn_model_weights_path)
+    fsrcnn_model = load_state_dict(fsrcnn_model, args.fsrcnn_model_weights_path)
     g_model = load_state_dict(g_model, args.model_weights_path)
     print(f"Load `{args.model_arch_name}` model weights `{os.path.abspath(args.model_weights_path)}` successfully.")
 
@@ -100,6 +100,9 @@ def main(args):
     # sr_y_tensor = F.interpolate(lr_y_tensor, scale_factor=4, mode='bicubic')
     sr_y_image = imgproc.tensor_to_image(sr_y_tensor, range_norm=False, half=False)
     sr_y_image = sr_y_image.astype(np.float32) / 255.0
+    
+    # bic_cb_image = np.full_like(bic_cb_image, 128 / 255.0)
+    # bic_cr_image = np.full_like(bic_cr_image, 128 / 255.0)
 
     sr_ycbcr_image = cv2.merge([sr_y_image[:, :, 0], bic_cb_image, bic_cr_image])
     sr_image = imgproc.ycbcr_to_bgr(sr_ycbcr_image)
