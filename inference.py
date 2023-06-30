@@ -23,6 +23,7 @@ from torch import nn
 import config
 import imgproc
 import model
+from unet import unet_model
 from utils import load_state_dict
 
 import torch.nn.functional as F
@@ -47,7 +48,7 @@ def build_model(device: torch.device) -> nn.Module:
     # Initialize the super-resolution model
     espcn = model.__dict__["ESPCN"](in_channels = 1, out_channels = 1, channels = 64, upscale_factor = 4)
     fsrcnn = model.__dict__["FSRCNN"](upscale_factor=4)
-    g_model = model.__dict__["UNet"](config.in_channels, config.out_channels)
+    g_model = unet_model.__dict__["UNet"](config.in_channels, config.out_channels)
     
     espcn = espcn.to(device)
     fsrcnn = espcn.to(device)
@@ -113,7 +114,7 @@ def main(args):
     sr_image = imgproc.ycbcr_to_bgr(sr_ycbcr_image)
     cv2.imwrite(args.output_espcn_path, sr_image * 255.0)
 
-    print(f"SR image save to `{args.output_path}`")
+    print(f"SR image save to `{args.output_espcn_path}`")
     
     sr_y_image = imgproc.tensor_to_image(sr_2, range_norm=False, half=False)
     sr_y_image = sr_y_image.astype(np.float32) / 255.0
@@ -122,7 +123,7 @@ def main(args):
     sr_image = imgproc.ycbcr_to_bgr(sr_ycbcr_image)
     cv2.imwrite(args.output_fsrcnn_path, sr_image * 255.0)
 
-    print(f"SR image save to `{args.output_path}`")
+    print(f"SR image save to `{args.output_fsrcnn_path}`")
 
 
 if __name__ == "__main__":
