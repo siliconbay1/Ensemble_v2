@@ -1,10 +1,13 @@
 # Ensemble_v2
 
 ## Environment
+```text
 Here, python pytorch version are found
 install_pytorch.bat
-and
+
+
 pip install -r requirements.txt
+```
 
 ## Download dataset
 - [Google Driver](https://drive.google.com/file/d/1f2rrFlF9OEXIqPTQnyyGxctFYwBUmzkm/view?usp=share_link)
