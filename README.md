@@ -1,11 +1,11 @@
 # Ensemble_v2
 
-## Environment
+## Setup
 ```text
-Here, python pytorch version are found
+Here this file, python pytorch version are found
 install_pytorch.bat
 
-
+Install packages in requirements.txt
 pip install -r requirements.txt
 ```
 
@@ -24,7 +24,7 @@ image files should exist as strucutured
 
 
 go to scripts folder and use run.py
-~#python run_128.py
+~#python run.py
 
 os.system("python ./prepare_dataset.py --images_dir ../data/ImageNet/original --output_dir ../data/ImageNet/train --gt_image_size 96 --step 64 --num_workers 16")
 
