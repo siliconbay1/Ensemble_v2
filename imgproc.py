@@ -1,4 +1,4 @@
-# Copyright 2022 Dakewe Biotech Corporation. All Rights Reserved.
+# Copyright 2023 Dakewe Biotech Corporation. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
 #   You may obtain a copy of the License at
@@ -33,7 +33,6 @@ __all__ = [
 ]
 
 
-# Code reference `https://github.com/xinntao/BasicSR/blob/master/basicsr/utils/matlab_functions.py`
 def _cubic(x: Any) -> Any:
     """Implementation of `cubic` function in Matlab under Python language.
 
@@ -49,10 +48,9 @@ def _cubic(x: Any) -> Any:
     absx3 = absx ** 3
     return (1.5 * absx3 - 2.5 * absx2 + 1) * ((absx <= 1).type_as(absx)) + (
             -0.5 * absx3 + 2.5 * absx2 - 4 * absx + 2) * (
-               ((absx > 1) * (absx <= 2)).type_as(absx))
+        ((absx > 1) * (absx <= 2)).type_as(absx))
 
 
-# Code reference `https://github.com/xinntao/BasicSR/blob/master/basicsr/utils/matlab_functions.py`
 def _calculate_weights_indices(in_length: int,
                                out_length: int,
                                scale: float,
@@ -147,6 +145,7 @@ def image_to_tensor(image: ndarray, range_norm: bool, half: bool) -> Tensor:
 
     """
     # Convert image data type to Tensor data type
+    # tensor = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).float()
     tensor = F_vision.to_tensor(image)
 
     # Scale the image data from [0, 1] to [-1, 1]
@@ -181,12 +180,27 @@ def tensor_to_image(tensor: Tensor, range_norm: bool, half: bool) -> Any:
     if half:
         tensor = tensor.half()
 
-    image = tensor.squeeze_(0).permute(1, 2, 0).mul_(255).clamp_(0, 255).cpu().numpy().astype("uint8")
+    image = tensor.squeeze(0).permute(1, 2, 0).mul(255).clamp(0, 255).cpu().numpy().astype("uint8")
 
     return image
 
 
-def preprocess_one_image(image_path: str, device: torch.device) -> [Tensor, ndarray, ndarray]:
+def preprocess_one_image(image_path: str, range_norm: bool, half: bool, device: torch.device) -> Tensor:
+    # read an image using OpenCV
+    image = cv2.imread(image_path).astype(np.float32) / 255.0
+
+    # BGR image channel data to RGB image channel data
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    # Convert RGB image channel data to image formats supported by PyTorch
+    tensor = image_to_tensor(image, range_norm, half).unsqueeze_(0)
+
+    # Data transfer to the specified device
+    tensor = tensor.to(device, non_blocking=True)
+
+    return tensor
+
+def old_preprocess_one_image(image_path: str, device: torch.device) -> [Tensor, ndarray, ndarray]:
     image = cv2.imread(image_path).astype(np.float32) / 255.0
 
     # BGR to YCbCr
@@ -200,11 +214,16 @@ def preprocess_one_image(image_path: str, device: torch.device) -> [Tensor, ndar
 
     # Transfer tensor channel image format data to CUDA device
     y_tensor = y_tensor.to(device=device, non_blocking=True)
+    
+    # Convert image data to pytorch format data
+    tensor = image_to_tensor(image, False, False).unsqueeze_(0)
 
-    return y_tensor, cb_image, cr_image
+    # Transfer tensor channel image format data to CUDA device
+    tensor = tensor.to(device=device, non_blocking=True)
+
+    return tensor, y_tensor, y_image, cb_image, cr_image
 
 
-# Code reference `https://github.com/xinntao/BasicSR/blob/master/basicsr/utils/matlab_functions.py`
 def image_resize(image: Any, scale_factor: float, antialiasing: bool = True) -> Any:
     """Implementation of `imresize` function in Matlab under Python language.
 
@@ -582,17 +601,30 @@ def random_vertically_flip(image: np.ndarray, p: float = 0.5) -> np.ndarray:
 
 
 def center_crop_torch(
-        gt_images,
-        lr_images,
+        gt_images: ndarray or Tensor or list[ndarray] or list[Tensor],
+        lr_images: ndarray or Tensor or list[ndarray] or list[Tensor],
         gt_patch_size: int,
         upscale_factor: int,
 ) -> [ndarray, ndarray] or [Tensor, Tensor] or [list[ndarray], list[ndarray]] or [list[Tensor], list[Tensor]]:
+    """Intercept two images to specify the center area
+
+    Args:
+        gt_images (ndarray | Tensor | list[ndarray] | list[Tensor]): ground truth images read by PyTorch
+        lr_images (ndarray | Tensor | list[ndarray] | list[Tensor]): Low resolution images read by PyTorch
+        gt_patch_size (int): the size of the ground truth image after interception
+        upscale_factor (int): the ground truth image size is a magnification of the low resolution image size
+
+    Returns:
+        gt_images (ndarray or Tensor or): the intercepted ground truth image
+        lr_images (ndarray or Tensor or): low-resolution intercepted images
+
+    """
     if not isinstance(gt_images, list):
         gt_images = [gt_images]
     if not isinstance(lr_images, list):
         lr_images = [lr_images]
 
-    # Detect input image data type
+    # detect input image type
     input_type = "Tensor" if torch.is_tensor(lr_images[0]) else "Numpy"
 
     if input_type == "Tensor":
@@ -600,42 +632,42 @@ def center_crop_torch(
     else:
         lr_image_height, lr_image_width = lr_images[0].shape[0:2]
 
-    # Compute low-resolution image patch size
+    # Calculate the size of the low-resolution image that needs to be intercepted
     lr_patch_size = gt_patch_size // upscale_factor
 
-    # Calculate the start indices of the crop
+    # Just need to find the top and left coordinates of the image
     lr_top = (lr_image_height - lr_patch_size) // 2
     lr_left = (lr_image_width - lr_patch_size) // 2
 
-    # Crop lr image patch
+    # Capture low-resolution images
     if input_type == "Tensor":
         lr_images = [lr_image[
                      :,
                      :,
-                     lr_top:lr_top + lr_patch_size,
-                     lr_left:lr_left + lr_patch_size] for lr_image in lr_images]
+                     lr_top: lr_top + lr_patch_size,
+                     lr_left: lr_left + lr_patch_size] for lr_image in lr_images]
     else:
         lr_images = [lr_image[
-                     lr_top:lr_top + lr_patch_size,
-                     lr_left:lr_left + lr_patch_size,
+                     lr_top: lr_top + lr_patch_size,
+                     lr_left: lr_left + lr_patch_size,
                      ...] for lr_image in lr_images]
 
-    # Crop gt image patch
+    # Intercept the ground truth image
     gt_top, gt_left = int(lr_top * upscale_factor), int(lr_left * upscale_factor)
 
     if input_type == "Tensor":
         gt_images = [v[
                      :,
                      :,
-                     gt_top:gt_top + gt_patch_size,
-                     gt_left:gt_left + gt_patch_size] for v in gt_images]
+                     gt_top: gt_top + gt_patch_size,
+                     gt_left: gt_left + gt_patch_size] for v in gt_images]
     else:
         gt_images = [v[
-                     gt_top:gt_top + gt_patch_size,
-                     gt_left:gt_left + gt_patch_size,
+                     gt_top: gt_top + gt_patch_size,
+                     gt_left: gt_left + gt_patch_size,
                      ...] for v in gt_images]
 
-    # When image number is 1
+    # When the input has only one image
     if len(gt_images) == 1:
         gt_images = gt_images[0]
     if len(lr_images) == 1:
@@ -645,17 +677,31 @@ def center_crop_torch(
 
 
 def random_crop_torch(
-        gt_images,
-        lr_images,
+        gt_images: ndarray or Tensor or list[ndarray] or list[Tensor],
+        lr_images: ndarray or Tensor or list[ndarray] or list[Tensor],
         gt_patch_size: int,
         upscale_factor: int,
 ) -> [ndarray, ndarray] or [Tensor, Tensor] or [list[ndarray], list[ndarray]] or [list[Tensor], list[Tensor]]:
+    """Randomly intercept two images in the specified area
+
+    Args:
+        gt_images (ndarray | Tensor | list[ndarray] | list[Tensor]): ground truth images read by PyTorch
+        lr_images (ndarray | Tensor | list[ndarray] | list[Tensor]): Low resolution images read by PyTorch
+        gt_patch_size (int): the size of the ground truth image after interception
+        upscale_factor (int): the ground truth image size is a magnification of the low resolution image size
+
+    Returns:
+        gt_images (ndarray or Tensor or): the intercepted ground truth image
+        lr_images (ndarray or Tensor or): low-resolution intercepted images
+
+    """
+
     if not isinstance(gt_images, list):
         gt_images = [gt_images]
     if not isinstance(lr_images, list):
         lr_images = [lr_images]
 
-    # Detect input image data type
+    # detect input image type
     input_type = "Tensor" if torch.is_tensor(lr_images[0]) else "Numpy"
 
     if input_type == "Tensor":
@@ -663,42 +709,42 @@ def random_crop_torch(
     else:
         lr_image_height, lr_image_width = lr_images[0].shape[0:2]
 
-    # Compute low-resolution image patch size
+    # Calculate the size of the low-resolution image that needs to be intercepted
     lr_patch_size = gt_patch_size // upscale_factor
 
     # Just need to find the top and left coordinates of the image
     lr_top = random.randint(0, lr_image_height - lr_patch_size)
     lr_left = random.randint(0, lr_image_width - lr_patch_size)
 
-    # Crop lr image patch
+    # Capture low-resolution images
     if input_type == "Tensor":
         lr_images = [lr_image[
                      :,
                      :,
-                     lr_top:lr_top + lr_patch_size,
-                     lr_left:lr_left + lr_patch_size] for lr_image in lr_images]
+                     lr_top: lr_top + lr_patch_size,
+                     lr_left: lr_left + lr_patch_size] for lr_image in lr_images]
     else:
         lr_images = [lr_image[
-                     lr_top:lr_top + lr_patch_size,
-                     lr_left:lr_left + lr_patch_size,
+                     lr_top: lr_top + lr_patch_size,
+                     lr_left: lr_left + lr_patch_size,
                      ...] for lr_image in lr_images]
 
-    # Crop gt image patch
+    # Intercept the ground truth image
     gt_top, gt_left = int(lr_top * upscale_factor), int(lr_left * upscale_factor)
 
     if input_type == "Tensor":
         gt_images = [v[
                      :,
                      :,
-                     gt_top:gt_top + gt_patch_size,
-                     gt_left:gt_left + gt_patch_size] for v in gt_images]
+                     gt_top: gt_top + gt_patch_size,
+                     gt_left: gt_left + gt_patch_size] for v in gt_images]
     else:
         gt_images = [v[
-                     gt_top:gt_top + gt_patch_size,
-                     gt_left:gt_left + gt_patch_size,
+                     gt_top: gt_top + gt_patch_size,
+                     gt_left: gt_left + gt_patch_size,
                      ...] for v in gt_images]
 
-    # When image number is 1
+    # When the input has only one image
     if len(gt_images) == 1:
         gt_images = gt_images[0]
     if len(lr_images) == 1:
@@ -708,15 +754,31 @@ def random_crop_torch(
 
 
 def random_rotate_torch(
-        gt_images,
-        lr_images,
+        gt_images: ndarray or Tensor or list[ndarray] or list[Tensor],
+        lr_images: ndarray or Tensor or list[ndarray] or list[Tensor],
         upscale_factor: int,
         angles: list,
         gt_center: tuple = None,
         lr_center: tuple = None,
         rotate_scale_factor: float = 1.0
 ) -> [ndarray, ndarray] or [Tensor, Tensor] or [list[ndarray], list[ndarray]] or [list[Tensor], list[Tensor]]:
-    # Random select specific angle
+    """Randomly rotate the image
+
+    Args:
+        gt_images (ndarray | Tensor | list[ndarray] | list[Tensor]): ground truth images read by the PyTorch library
+        lr_images (ndarray | Tensor | list[ndarray] | list[Tensor]): low-resolution images read by the PyTorch library
+        angles (list): List of random rotation angles
+        upscale_factor (int): the ground truth image size is a magnification of the low resolution image size
+        gt_center (optional, tuple[int, int]): The center point of the ground truth image selection. Default: ``None``
+        lr_center (optional, tuple[int, int]): Low resolution image selection center point. Default: ``None``
+        rotate_scale_factor (optional, float): Rotation scaling factor. Default: 1.0
+
+    Returns:
+        gt_images (ndarray or Tensor or): ground truth image after rotation
+        lr_images (ndarray or Tensor or): Rotated low-resolution images
+
+    """
+    # Randomly choose the rotation angle
     angle = random.choice(angles)
 
     if not isinstance(gt_images, list):
@@ -724,7 +786,7 @@ def random_rotate_torch(
     if not isinstance(lr_images, list):
         lr_images = [lr_images]
 
-    # Detect input image data type
+    # detect input image type
     input_type = "Tensor" if torch.is_tensor(lr_images[0]) else "Numpy"
 
     if input_type == "Tensor":
@@ -732,7 +794,7 @@ def random_rotate_torch(
     else:
         lr_image_height, lr_image_width = lr_images[0].shape[0:2]
 
-    # Rotate LR image
+    # Rotate the low-res image
     if lr_center is None:
         lr_center = [lr_image_width // 2, lr_image_height // 2]
 
@@ -743,7 +805,7 @@ def random_rotate_torch(
     else:
         lr_images = [cv2.warpAffine(lr_image, lr_matrix, (lr_image_width, lr_image_height)) for lr_image in lr_images]
 
-    # Rotate GT image
+    # rotate the ground truth image
     gt_image_width = int(lr_image_width * upscale_factor)
     gt_image_height = int(lr_image_height * upscale_factor)
 
@@ -757,7 +819,7 @@ def random_rotate_torch(
     else:
         gt_images = [cv2.warpAffine(gt_image, gt_matrix, (gt_image_width, gt_image_height)) for gt_image in gt_images]
 
-    # When image number is 1
+    # When the input has only one image
     if len(gt_images) == 1:
         gt_images = gt_images[0]
     if len(lr_images) == 1:
@@ -767,11 +829,23 @@ def random_rotate_torch(
 
 
 def random_horizontally_flip_torch(
-        gt_images,
-        lr_images,
+        gt_images: ndarray or Tensor or list[ndarray] or list[Tensor],
+        lr_images: ndarray or Tensor or list[ndarray] or list[Tensor],
         p: float = 0.5
 ) -> [ndarray, ndarray] or [Tensor, Tensor] or [list[ndarray], list[ndarray]] or [list[Tensor], list[Tensor]]:
-    # Get horizontal flip probability
+    """Randomly flip the image up and down
+
+    Args:
+        gt_images (ndarray): ground truth images read by the PyTorch library
+        lr_images (ndarray): low resolution images read by the PyTorch library
+        p (optional, float): flip probability. Default: 0.5
+
+    Returns:
+        gt_images (ndarray or Tensor or): flipped ground truth images
+        lr_images (ndarray or Tensor or): flipped low-resolution images
+
+    """
+    # Randomly generate flip probability
     flip_prob = random.random()
 
     if not isinstance(gt_images, list):
@@ -779,7 +853,7 @@ def random_horizontally_flip_torch(
     if not isinstance(lr_images, list):
         lr_images = [lr_images]
 
-    # Detect input image data type
+    # detect input image type
     input_type = "Tensor" if torch.is_tensor(lr_images[0]) else "Numpy"
 
     if flip_prob > p:
@@ -790,7 +864,7 @@ def random_horizontally_flip_torch(
             lr_images = [cv2.flip(lr_image, 1) for lr_image in lr_images]
             gt_images = [cv2.flip(gt_image, 1) for gt_image in gt_images]
 
-    # When image number is 1
+    # When the input has only one image
     if len(gt_images) == 1:
         gt_images = gt_images[0]
     if len(lr_images) == 1:
@@ -800,11 +874,23 @@ def random_horizontally_flip_torch(
 
 
 def random_vertically_flip_torch(
-        gt_images,
-        lr_images,
+        gt_images: ndarray or Tensor or list[ndarray] or list[Tensor],
+        lr_images: ndarray or Tensor or list[ndarray] or list[Tensor],
         p: float = 0.5
 ) -> [ndarray, ndarray] or [Tensor, Tensor] or [list[ndarray], list[ndarray]] or [list[Tensor], list[Tensor]]:
-    # Get vertical flip probability
+    """Randomly flip the image left and right
+
+    Args:
+        gt_images (ndarray): ground truth images read by the PyTorch library
+        lr_images (ndarray): low resolution images read by the PyTorch library
+        p (optional, float): flip probability. Default: 0.5
+
+    Returns:
+        gt_images (ndarray or Tensor or): flipped ground truth images
+        lr_images (ndarray or Tensor or): flipped low-resolution images
+
+    """
+    # Randomly generate flip probability
     flip_prob = random.random()
 
     if not isinstance(gt_images, list):
@@ -812,7 +898,7 @@ def random_vertically_flip_torch(
     if not isinstance(lr_images, list):
         lr_images = [lr_images]
 
-    # Detect input image data type
+    # detect input image type
     input_type = "Tensor" if torch.is_tensor(lr_images[0]) else "Numpy"
 
     if flip_prob > p:
@@ -823,7 +909,7 @@ def random_vertically_flip_torch(
             lr_images = [cv2.flip(lr_image, 0) for lr_image in lr_images]
             gt_images = [cv2.flip(gt_image, 0) for gt_image in gt_images]
 
-    # When image number is 1
+    # When the input has only one image
     if len(gt_images) == 1:
         gt_images = gt_images[0]
     if len(lr_images) == 1:

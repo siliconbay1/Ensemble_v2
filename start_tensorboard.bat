@@ -1,4 +1,7 @@
-set venv=pytorch
+::taskkill /IM chrome.exe
+start chrome.exe http://localhost:6006/?darkMode=true#timeseries
+
+set venv=ensemble
 
 call %USERPROFILE%\Anaconda3\Scripts\activate %USERPROFILE%\Anaconda3
 call activate %venv%

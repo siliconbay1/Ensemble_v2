@@ -29,7 +29,7 @@ __all__ = [
 ]
 
 
-class TrainValidImageDataset(Dataset):
+class BaseImageDataset(Dataset):
     """Define training/valid dataset loading methods.
 
     Args:
@@ -45,46 +45,42 @@ class TrainValidImageDataset(Dataset):
             gt_image_dir: str,
             gt_image_size: int,
             upscale_factor: int,
-            mode: str,
     ) -> None:
-        super(TrainValidImageDataset, self).__init__()
+        super(BaseImageDataset, self).__init__()
         self.image_file_names = [os.path.join(gt_image_dir, image_file_name) for image_file_name in
                                  os.listdir(gt_image_dir)]
         # self.image_file_names = self.image_file_names[:16*5000]
         self.gt_image_size = gt_image_size
         self.upscale_factor = upscale_factor
-        self.mode = mode
 
     def __getitem__(self, batch_index: int) -> [dict[str, Tensor], dict[str, Tensor]]:
         # Read a batch of image data
         gt_crop_image = cv2.imread(self.image_file_names[batch_index]).astype(np.float32) / 255.
 
         # Image processing operations
-        if self.mode == "Train":
-            gt_crop_image = imgproc.random_crop(gt_crop_image, self.gt_image_size)
-        elif self.mode == "Valid":
-            gt_crop_image = imgproc.center_crop(gt_crop_image, self.gt_image_size)
-        else:
-            raise ValueError("Unsupported data processing model, please use `Train` or `Valid`.")
+        gt_crop_image = imgproc.random_crop(gt_crop_image, self.gt_image_size)
 
         lr_crop_image = imgproc.image_resize(gt_crop_image, 1 / self.upscale_factor)
+        lr_up_image = imgproc.image_resize(lr_crop_image, self.upscale_factor)
+
 
         # BGR convert Y channel
         gt_crop_y_image = imgproc.bgr_to_ycbcr(gt_crop_image, only_use_y_channel=True)
         lr_crop_y_image = imgproc.bgr_to_ycbcr(lr_crop_image, only_use_y_channel=True)
+        lr_up_y_image = imgproc.bgr_to_ycbcr(lr_up_image, only_use_y_channel=True)
 
         # Convert image data into Tensor stream format (PyTorch).
         # Note: The range of input and output is between [0, 1]
         gt_crop_y_tensor = imgproc.image_to_tensor(gt_crop_y_image, False, False)
         lr_crop_y_tensor = imgproc.image_to_tensor(lr_crop_y_image, False, False)
-
-        return {"gt": gt_crop_y_tensor, "lr": lr_crop_y_tensor}
+        lr_up_y_tensor = imgproc.image_to_tensor(lr_up_y_image, False, False)
+        
+        return {"gt": gt_crop_y_tensor, "lr": lr_crop_y_tensor, "lr_up": lr_up_y_tensor}
 
     def __len__(self) -> int:
         return len(self.image_file_names)
 
-
-class TestImageDataset(Dataset):
+class PairedImageDataset(Dataset):
     """Define Test dataset loading methods.
 
     Args:
@@ -93,8 +89,9 @@ class TestImageDataset(Dataset):
     """
 
     def __init__(self, test_gt_images_dir: str, test_lr_images_dir: str) -> None:
-        super(TestImageDataset, self).__init__()
+        super(PairedImageDataset, self).__init__()
         # Get all image file names in folder
+        self.upscale_factor = 4
         self.gt_image_file_names = [os.path.join(test_gt_images_dir, x) for x in os.listdir(test_gt_images_dir)]
         self.lr_image_file_names = [os.path.join(test_lr_images_dir, x) for x in os.listdir(test_lr_images_dir)]
 
@@ -102,21 +99,35 @@ class TestImageDataset(Dataset):
         # Read a batch of image data
         gt_image = cv2.imread(self.gt_image_file_names[batch_index]).astype(np.float32) / 255.
         lr_image = cv2.imread(self.lr_image_file_names[batch_index]).astype(np.float32) / 255.
+        
+        lr_up_image = imgproc.image_resize(lr_image, self.upscale_factor)
 
+        # # BGR convert Y channel
+        # gt_y_image = imgproc.bgr_to_ycbcr(gt_image, only_use_y_channel=True)
+        # lr_y_image = imgproc.bgr_to_ycbcr(lr_image, only_use_y_channel=True)
+
+        # # Convert image data into Tensor stream format (PyTorch).
+        # # Note: The range of input and output is between [0, 1]
+        # gt_y_tensor = imgproc.image_to_tensor(gt_y_image, False, False)
+        # lr_y_tensor = imgproc.image_to_tensor(lr_y_image, False, False)
+        
+        # return {"gt": gt_ycbcr_tensor, "lr": lr_ycbcr_tensor}
+        
         # BGR convert Y channel
-        gt_y_image = imgproc.bgr_to_ycbcr(gt_image, only_use_y_channel=True)
-        lr_y_image = imgproc.bgr_to_ycbcr(lr_image, only_use_y_channel=True)
-
+        gt_ycbcr_image = imgproc.bgr_to_ycbcr(gt_image, only_use_y_channel=False)
+        lr_ycbcr_image = imgproc.bgr_to_ycbcr(lr_image, only_use_y_channel=False)
+        lr_up_ycbcr_image = imgproc.bgr_to_ycbcr(lr_up_image, only_use_y_channel=False)
+        
         # Convert image data into Tensor stream format (PyTorch).
         # Note: The range of input and output is between [0, 1]
-        gt_y_tensor = imgproc.image_to_tensor(gt_y_image, False, False)
-        lr_y_tensor = imgproc.image_to_tensor(lr_y_image, False, False)
+        gt_ycbcr_tensor = imgproc.image_to_tensor(gt_ycbcr_image, False, False)
+        lr_ycbcr_tensor = imgproc.image_to_tensor(lr_ycbcr_image, False, False)
+        lr_up_ycbcr_tensor = imgproc.image_to_tensor(lr_up_ycbcr_image, False, False)
 
-        return {"gt": gt_y_tensor, "lr": lr_y_tensor}
+        return {"gt": gt_ycbcr_tensor, "lr": lr_ycbcr_tensor, "lr_up":lr_up_ycbcr_tensor}
 
     def __len__(self) -> int:
         return len(self.gt_image_file_names)
-
 
 class PrefetchGenerator(threading.Thread):
     """A fast data prefetch generator.

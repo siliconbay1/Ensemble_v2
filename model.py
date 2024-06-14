@@ -1,4 +1,4 @@
-# Copyright 2020 Dakewe Biotech Corporation. All Rights Reserved.
+# Copyright 2022 Dakewe Biotech Corporation. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
 #   You may obtain a copy of the License at
@@ -12,258 +12,146 @@
 # limitations under the License.
 # ==============================================================================
 import math
-from math import sqrt
+import os
+from typing import Any, cast, Dict, List, Union
+
 import torch
 from torch import nn, Tensor
-from torch.nn import functional as F_torch
-from torchvision import models
-from torchvision import transforms
+from torch.nn import functional as F
+from torchvision import models, transforms
 from torchvision.models.feature_extraction import create_feature_extractor
 
-from torch.autograd import Variable
-import torch.autograd as autograd
-import numpy as np
-
 __all__ = [
-    "ESPCN", "FSRCNN", "Generator", "Discriminator",
-    "espcn_x2", "espcn_x3", "espcn_x4", "espcn_x8",
+    "DiscriminatorForVGG", "SRResNet", "Unet_Discriminator",
+    "discriminator_for_vgg", "srresnet_x2", "srresnet_x3", "srresnet_x4",
 ]
 
-class SRResNet(nn.Module):
-    def __init__(
-            self,
-            in_channels: int,
-            out_channels: int,
-            channels: int,
-            num_rcb: int,
-            upscale_factor: int
-    ) -> None:
-        super(SRResNet, self).__init__()
-        # Low frequency information extraction layer
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, channels, (9, 9), (1, 1), (4, 4)),
-            nn.PReLU(),
+feature_extractor_net_cfgs: Dict[str, List[Union[str, int]]] = {
+    "vgg11": [64, "M", 128, "M", 256, 256, "M", 512, 512, "M", 512, 512, "M"],
+    "vgg13": [64, 64, "M", 128, 128, "M", 256, 256, "M", 512, 512, "M", 512, 512, "M"],
+    "vgg16": [64, 64, "M", 128, 128, "M", 256, 256, 256, "M", 512, 512, 512, "M", 512, 512, 512, "M"],
+    "vgg19": [64, 64, "M", 128, 128, "M", 256, 256, 256, 256, "M", 512, 512, 512, 512, "M", 512, 512, 512, 512, "M"],
+}
+
+
+class DoubleConv(nn.Module):
+    """(convolution => [BN] => ReLU) * 2"""
+
+    def __init__(self, in_channels, out_channels, mid_channels=None):
+        super().__init__()
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
         )
 
-        # High frequency information extraction block
-        trunk = []
-        for _ in range(num_rcb):
-            trunk.append(_ResidualConvBlock(channels))
-        self.trunk = nn.Sequential(*trunk)
+    def forward(self, x):
+        return self.double_conv(x)
 
-        # High-frequency information linear fusion layer
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(channels),
+
+class Down(nn.Module):
+    """Downscaling with maxpool then double conv"""
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_channels, out_channels)
         )
 
-        # zoom block
-        upsampling = []
-        if upscale_factor == 2 or upscale_factor == 4 or upscale_factor == 8:
-            for _ in range(int(math.log(upscale_factor, 2))):
-                upsampling.append(_UpsampleBlock(channels, 2))
-        elif upscale_factor == 3:
-            upsampling.append(_UpsampleBlock(channels, 3))
-        self.upsampling = nn.Sequential(*upsampling)
+    def forward(self, x):
+        return self.maxpool_conv(x)
 
-        # reconstruction block
-        self.conv3 = nn.Conv2d(channels, out_channels, (9, 9), (1, 1), (4, 4))
 
-        # Initialize neural network weights
-        self._initialize_weights()
+class Up(nn.Module):
+    """Upscaling then double conv"""
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self._forward_impl(x)
+    def __init__(self, in_channels, out_channels, bilinear=True):
+        super().__init__()
 
-    # Support torch.script function
-    def _forward_impl(self, x: Tensor) -> Tensor:
-        out1 = self.conv1(x)
-        out = self.trunk(out1)
-        out2 = self.conv2(out)
-        out = torch.add(out1, out2)
-        # out = self.upsampling(out)
-        out = self.conv3(out)
+        # if bilinear, use the normal convolutions to reduce the number of channels
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
+        else:
+            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_channels, out_channels)
 
-        out = torch.clamp_(out, 0.0, 1.0)
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        # input is CHW
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
 
-        return out
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        # if you have padding issues, see
+        # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
+        # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
 
-    def _initialize_weights(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.constant_(module.weight, 1)
 
-class _UpsampleBlock(nn.Module):
-    def __init__(self, channels: int, upscale_factor: int) -> None:
-        super(_UpsampleBlock, self).__init__()
-        self.upsample_block = nn.Sequential(
-            nn.Conv2d(channels, channels * upscale_factor * upscale_factor, (3, 3), (1, 1), (1, 1)),
-            nn.PixelShuffle(2),
-            nn.PReLU(),
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(OutConv, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1),
+            # nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            # nn.BatchNorm2d(out_channels)
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        out = self.upsample_block(x)
+    def forward(self, x):
+        return self.conv(x)
 
-        return out
-# ----------------------------------
-# this discriminator came from SRGAN
-# ----------------------------------
-class _Discriminator(nn.Module):
-    def __init__(self) -> None:
-        super(_Discriminator, self).__init__()
-        self.features = nn.Sequential(
-            # input size. (3) x 96 x 96
-            nn.Conv2d(1, 64, (3, 3), (1, 1), (1, 1), bias=True),
-            nn.LeakyReLU(0.2, True),
-            # state size. (64) x 48 x 48
-            nn.Conv2d(64, 64, (3, 3), (2, 2), (1, 1), bias=False),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(64, 128, (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, True),
-            # state size. (128) x 24 x 24
-            nn.Conv2d(128, 128, (3, 3), (2, 2), (1, 1), bias=False),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(128, 256, (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, True),
-            # state size. (256) x 12 x 12
-            nn.Conv2d(256, 256, (3, 3), (2, 2), (1, 1), bias=False),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(256, 512, (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, True),
-            # state size. (512) x 6 x 6
-            nn.Conv2d(512, 512, (3, 3), (2, 2), (1, 1), bias=False),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, True),
-        )
+class UNet(nn.Module):
+    def __init__(self, n_channels, n_classes, bilinear=False):
+        super(UNet, self).__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.bilinear = bilinear
 
-        self.classifier = nn.Sequential(
-            nn.Linear(512 * 6 * 6, 1024),
-            nn.LeakyReLU(0.2, True),
-            nn.Linear(1024, 1),
-        )
+        self.inc = (DoubleConv(n_channels, 64))
+        self.down1 = (Down(64, 128))
+        self.down2 = (Down(128, 256))
+        self.down3 = (Down(256, 512))
+        factor = 2 if bilinear else 1
+        self.down4 = (Down(512, 1024 // factor))
+        self.up1 = (Up(1024, 512 // factor, bilinear))
+        self.up2 = (Up(512, 256 // factor, bilinear))
+        self.up3 = (Up(256, 128 // factor, bilinear))
+        self.up4 = (Up(128, 64, bilinear))
+        self.outc = (OutConv(64, n_classes))
 
-    def forward(self, x: Tensor) -> Tensor:
-        # Input image size must equal 96
-        assert x.shape[2] == 96 and x.shape[3] == 96, "Image shape must equal 96x96"
+    def forward(self, x):
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
+        logits = self.outc(x)
+        return logits
 
-        out = self.features(x)
-        out = torch.flatten(out, 1)
-        out = self.classifier(out)
-
-        return out
-
-class _ResidualConvBlock(nn.Module):
-    def __init__(self, channels: int) -> None:
-        super(_ResidualConvBlock, self).__init__()
-        self.rcb = nn.Sequential(
-            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(channels),
-            nn.PReLU(),
-            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(channels),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        identity = x
-
-        out = self.rcb(x)
-
-        out = torch.add(out, identity)
-
-        return out
-
-class Generator(nn.Module):
-    def __init__(self):
-        super(Generator, self).__init__()
-        
-        in_channels = 1
-        
-        self.conv_layer = nn.ModuleList()
-        in_filters = in_channels
-        dim = 32
-        for i, out_filters in enumerate([dim, dim, dim*2, dim*2, dim*4, dim*4, dim*8, dim*8, dim*4, dim*4, dim*2, dim*2, dim, dim]):
-        # for i, out_filters in enumerate([32, 32, 64, 64, 64, 64, 32, 32]):
-            self.conv_layer.append(nn.Conv2d(in_filters, out_filters, 3, stride=1, padding=1))
-            if i == 8 or i == 10 or i == 12:
-                in_filters = out_filters * 2
-            else:
-                in_filters = out_filters
-
-        self.Relu = nn.ReLU()
-        # reconstruction block
-        self.final_conv_layer = nn.Conv2d(in_filters, in_channels, 3, stride=1, padding=1)
-
-    def forward(self, img):
-        skip_conn = []
-        for i in range(len(self.conv_layer)):
-            img = self.conv_layer[i](img)
-            if i == 1 or i == 3 or i == 5:
-                skip_conn.append(img)
-            img = nn.LayerNorm(img.shape[3]).cuda()(img)
-            if i == 8 or i == 10 or i == 12:
-                img = self.Relu(img)
-                img = torch.cat((img, skip_conn.pop()), 1)
-            else:
-                img = self.Relu(img)
-        img = self.final_conv_layer(img)
-        return img
-
-class Discriminator(nn.Module):
-    def __init__(self, input_shape):
-        super(Discriminator, self).__init__()
-
-        self.input_shape = input_shape
-        self.in_channels, self.in_height, self.in_width = self.input_shape[0], self.input_shape[1], self.input_shape[2]
-        print("in_channels, in_height, in_width=", self.in_channels, self.in_height, self.in_width)
-        in_channels = self.in_channels
-        patch_h, patch_w = int(self.in_height / 2 ** 4), int(self.in_width / 2 ** 4)
-        patch_h, patch_w = int(patch_h/patch_h), int(patch_w/patch_w)
-        self.output_shape = (in_channels, patch_h, patch_w)
-        print("Discriminator.output_shape=",self.output_shape)
-
-        def ConvBlock(in_filters, out_filters, _stride=False):
-            if _stride:
-                return nn.Conv2d(in_filters, out_filters, kernel_size=3, stride=2, padding=1)
-            else:
-                return nn.Conv2d(in_filters, out_filters, kernel_size=3, stride=1, padding=1)
-
-        self.conv_layer = nn.ModuleList()
-        in_filters = in_channels
-        for i, out_filters in enumerate([64, 128, 256, 512, 1]):
-            self.conv_layer.append(ConvBlock(in_filters, out_filters, _stride=(i != 3 and i != 4)))
-            in_filters = out_filters
-            
-        self.LRelu = nn.LeakyReLU(0.2, inplace=True)
-        self.AAP = nn.AdaptiveAvgPool2d(1)
-        
-    def forward(self, img):
-        for i in range(len(self.conv_layer)):
-            img = self.conv_layer[i](img)
-            img = nn.LayerNorm(img.shape[3]).cuda()(img)
-            img = self.LRelu(img)
-        img = self.AAP(img)
-        return img
-
-class FeatureExtractor(nn.Module):
-    def __init__(self):
-        super(FeatureExtractor, self).__init__()
-        vgg19_model = vgg19(pretrained=True)
-        self.feature_extractor = nn.Sequential(*list(vgg19_model.features.children())[:18])
-
-    def forward(self, img):
-        return self.feature_extractor(img)
-
+    def use_checkpointing(self):
+        self.inc = torch.utils.checkpoint(self.inc)
+        self.down1 = torch.utils.checkpoint(self.down1)
+        self.down2 = torch.utils.checkpoint(self.down2)
+        self.down3 = torch.utils.checkpoint(self.down3)
+        self.down4 = torch.utils.checkpoint(self.down4)
+        self.up1 = torch.utils.checkpoint(self.up1)
+        self.up2 = torch.utils.checkpoint(self.up2)
+        self.up3 = torch.utils.checkpoint(self.up3)
+        self.up4 = torch.utils.checkpoint(self.up4)
+        self.outc = torch.utils.checkpoint(self.outc)
 
 class FSRCNN(nn.Module):
     """
@@ -326,7 +214,7 @@ class FSRCNN(nn.Module):
     def _initialize_weights(self) -> None:
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.normal_(m.weight.data, mean=0.0, std=sqrt(2 / (m.out_channels * m.weight.data[0][0].numel())))
+                nn.init.normal_(m.weight.data, mean=0.0, std=math.sqrt(2 / (m.out_channels * m.weight.data[0][0].numel())))
                 nn.init.zeros_(m.bias.data)
 
         nn.init.normal_(self.deconv.weight.data, mean=0.0, std=0.001)
@@ -384,26 +272,377 @@ class ESPCN(nn.Module):
         x = torch.clamp_(x, 0.0, 1.0)
 
         return x
-
-def _discriminator(*kwargs) -> _Discriminator:
-    model = _Discriminator(*kwargs)
     
-def discriminator(*kwargs) -> Discriminator:
-    model = Discriminator(*kwargs)
+class ConvReLU(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super(ConvReLU, self).__init__()
+        self.conv = nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=False)
+        self.relu = nn.ReLU(True)
 
-    return model
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.conv(x)
+        out = self.relu(out)
 
-def generator() -> Generator:
-    model = Generator()
+        return out
 
-    return model
+class VDSR(nn.Module):
+    def __init__(self) -> None:
+        super(VDSR, self).__init__()
+        # Input layer
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(1, 64, (3, 3), (1, 1), (1, 1), bias=False),
+            nn.ReLU(True),
+        )
 
-def espcn_x4(**kwargs) -> ESPCN:
-    model = ESPCN(upscale_factor=4, **kwargs)
+        # Features trunk blocks
+        trunk = []
+        for _ in range(18):
+            trunk.append(ConvReLU(64))
+        self.trunk = nn.Sequential(*trunk)
 
-    return model
+        # Output layer
+        self.conv2 = nn.Conv2d(64, 1, (3, 3), (1, 1), (1, 1), bias=False)
 
-class _ContentLoss(nn.Module):
+        # Initialize model weights
+        self._initialize_weights()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_impl(x)
+
+    # Support torch.script function
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+
+        out = self.conv1(x)
+        out = self.trunk(out)
+        out = self.conv2(out)
+
+        out = torch.add(out, identity)
+
+        return out
+
+    def _initialize_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                module.weight.data.normal_(0.0, math.sqrt(2 / (module.kernel_size[0] * module.kernel_size[1] * module.out_channels)))
+
+class ResidualConvBlock(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super(ResidualConvBlock, self).__init__()
+        self.rcb = nn.Sequential(
+            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1)),
+            nn.ReLU(True),
+            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1)),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+
+        out = self.rcb(x)
+
+        out = torch.mul(out, 0.1)
+        out = torch.add(out, identity)
+
+        return out
+
+class UpsampleBlock(nn.Module):
+    def __init__(self, channels: int, upscale_factor: int) -> None:
+        super(UpsampleBlock, self).__init__()
+        self.upsample_block = nn.Sequential(
+            nn.Conv2d(channels, channels * upscale_factor * upscale_factor, (3, 3), (1, 1), (1, 1)),
+            nn.PixelShuffle(upscale_factor),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.upsample_block(x)
+
+        return out
+
+class EDSR(nn.Module):
+    def __init__(self, upscale_factor: int) -> None:
+        super(EDSR, self).__init__()
+        # First layer
+        self.conv1 = nn.Conv2d(3, 64, (3, 3), (1, 1), (1, 1))
+
+        # Residual blocks
+        trunk = []
+        for _ in range(16):
+            trunk.append(ResidualConvBlock(64))
+        self.trunk = nn.Sequential(*trunk)
+
+        # Second layer
+        self.conv2 = nn.Conv2d(64, 64, (3, 3), (1, 1), (1, 1))
+
+        # Upsampling layers
+        upsampling = []
+        if upscale_factor == 2 or upscale_factor == 4:
+            for _ in range(int(math.log(upscale_factor, 2))):
+                upsampling.append(UpsampleBlock(64, 2))
+        elif upscale_factor == 3:
+            upsampling.append(UpsampleBlock(64, 3))
+        self.upsampling = nn.Sequential(*upsampling)
+
+        # Final output layer
+        self.conv3 = nn.Conv2d(64, 3, (3, 3), (1, 1), (1, 1))
+
+        self.register_buffer("mean", torch.Tensor([0.4488, 0.4371, 0.4040]).view(1, 3, 1, 1))
+        # self.register_buffer("mean", torch.Tensor([0.5]).view(1, 1, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_impl(x)
+
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
+        # The images by subtracting the mean RGB value of the DIV2K dataset.
+        out = x.sub_(self.mean).mul_(255.)
+
+        out1 = self.conv1(out)
+        out = self.trunk(out1)
+        out = self.conv2(out)
+        out = torch.add(out, out1)
+        out = self.upsampling(out)
+        out = self.conv3(out)
+
+        out = out.div_(255.).add_(self.mean)
+
+        return out
+
+    def _initialize_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.constant_(module.weight, 1)
+
+def _make_layers(net_cfg_name: str, batch_norm: bool = False) -> nn.Sequential:
+    net_cfg = feature_extractor_net_cfgs[net_cfg_name]
+    layers: nn.Sequential[nn.Module] = nn.Sequential()
+    in_channels = 3
+    for v in net_cfg:
+        if v == "M":
+            layers.append(nn.MaxPool2d((2, 2), (2, 2)))
+        else:
+            v = cast(int, v)
+            conv2d = nn.Conv2d(in_channels, v, (3, 3), (1, 1), (1, 1))
+            if batch_norm:
+                layers.append(conv2d)
+                layers.append(nn.BatchNorm2d(v))
+                layers.append(nn.ReLU(True))
+            else:
+                layers.append(conv2d)
+                layers.append(nn.ReLU(True))
+            in_channels = v
+
+    return layers
+
+
+class _FeatureExtractor(nn.Module):
+    def __init__(
+            self,
+            net_cfg_name: str = "vgg19",
+            batch_norm: bool = False,
+            num_classes: int = 1000) -> None:
+        super(_FeatureExtractor, self).__init__()
+        self.features = _make_layers(net_cfg_name, batch_norm)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((7, 7))
+
+        self.classifier = nn.Sequential(
+            nn.Linear(512 * 7 * 7, 4096),
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Linear(4096, 4096),
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Linear(4096, num_classes),
+        )
+
+        # Initialize neural network weights
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, 0, 0.01)
+                nn.init.constant_(module.bias, 0)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self._forward_impl(x)
+
+    # Support torch.script function
+    def _forward_impl(self, x: Tensor) -> Tensor:
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+
+        return x
+
+
+class SRResNet(nn.Module):
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            channels: int,
+            num_rcb: int,
+            upscale: int,
+    ) -> None:
+        super(SRResNet, self).__init__()
+        # Low frequency information extraction layer
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, channels, (9, 9), (1, 1), (4, 4)),
+            nn.PReLU(),
+        )
+
+        # High frequency information extraction block
+        trunk = []
+        for _ in range(num_rcb):
+            trunk.append(_ResidualConvBlock(channels))
+        self.trunk = nn.Sequential(*trunk)
+
+        # High-frequency information linear fusion layer
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=False),
+            nn.BatchNorm2d(channels),
+        )
+
+        # zoom block
+        upsampling = []
+        if upscale == 2 or upscale == 4 or upscale == 8:
+            for _ in range(int(math.log(upscale, 2))):
+                upsampling.append(_UpsampleBlock(channels, 2))
+        elif upscale == 3:
+            upsampling.append(_UpsampleBlock(channels, 3))
+        self.upsampling = nn.Sequential(*upsampling)
+
+        # reconstruction block
+        self.conv3 = nn.Conv2d(channels, out_channels, (9, 9), (1, 1), (4, 4))
+
+        # Initialize neural network weights
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.constant_(module.weight, 1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self._forward_impl(x)
+
+    # Support torch.script function
+    def _forward_impl(self, x: Tensor) -> Tensor:
+        conv1 = self.conv1(x)
+        x = self.trunk(conv1)
+        x = self.conv2(x)
+        x = torch.add(x, conv1)
+        x = self.upsampling(x)
+        x = self.conv3(x)
+
+        x = torch.clamp_(x, 0.0, 1.0)
+
+        return x
+
+
+class DiscriminatorForVGG(nn.Module):
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            channels: int,
+    ) -> None:
+        super(DiscriminatorForVGG, self).__init__()
+        self.features = nn.Sequential(
+            # input size. (3) x 96 x 96
+            nn.Conv2d(in_channels, channels, (3, 3), (1, 1), (1, 1), bias=True),
+            nn.LeakyReLU(0.2, True),
+            # state size. (64) x 48 x 48
+            nn.Conv2d(channels, channels, (3, 3), (2, 2), (1, 1), bias=False),
+            nn.BatchNorm2d(channels),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(channels, int(2 * channels), (3, 3), (1, 1), (1, 1), bias=False),
+            nn.BatchNorm2d(int(2 * channels)),
+            nn.LeakyReLU(0.2, True),
+            # state size. (128) x 24 x 24
+            nn.Conv2d(int(2 * channels), int(2 * channels), (3, 3), (2, 2), (1, 1), bias=False),
+            nn.BatchNorm2d(int(2 * channels)),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(int(2 * channels), int(4 * channels), (3, 3), (1, 1), (1, 1), bias=False),
+            nn.BatchNorm2d(int(4 * channels)),
+            nn.LeakyReLU(0.2, True),
+            # state size. (256) x 12 x 12
+            nn.Conv2d(int(4 * channels), int(4 * channels), (3, 3), (2, 2), (1, 1), bias=False),
+            nn.BatchNorm2d(int(4 * channels)),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(int(4 * channels), int(8 * channels), (3, 3), (1, 1), (1, 1), bias=False),
+            nn.BatchNorm2d(int(8 * channels)),
+            nn.LeakyReLU(0.2, True),
+            # state size. (512) x 6 x 6
+            nn.Conv2d(int(8 * channels), int(8 * channels), (3, 3), (2, 2), (1, 1), bias=False),
+            nn.BatchNorm2d(int(8 * channels)),
+            nn.LeakyReLU(0.2, True),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(int(8 * channels) * 6 * 6, 1024),
+            nn.LeakyReLU(0.2, True),
+            nn.Linear(1024, out_channels),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Input image size must equal 96
+        # assert x.size(2) == 96 and x.size(3) == 96, "Input image size must be is 96x96"
+
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+
+        return x
+
+
+class _ResidualConvBlock(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super(_ResidualConvBlock, self).__init__()
+        self.rcb = nn.Sequential(
+            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=False),
+            nn.BatchNorm2d(channels),
+            nn.PReLU(),
+            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=False),
+            nn.BatchNorm2d(channels),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        identity = x
+
+        x = self.rcb(x)
+
+        x = torch.add(x, identity)
+
+        return x
+
+
+class _UpsampleBlock(nn.Module):
+    def __init__(self, channels: int, upscale_factor: int) -> None:
+        super(_UpsampleBlock, self).__init__()
+        self.upsample_block = nn.Sequential(
+            nn.Conv2d(channels, channels * upscale_factor * upscale_factor, (3, 3), (1, 1), (1, 1)),
+            nn.PixelShuffle(2),
+            nn.PReLU(),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.upsample_block(x)
+
+        return x
+
+
+class ContentLoss(nn.Module):
     """Constructs a content loss function based on the VGG19 network.
     Using high-level feature mapping layers from the latter layers will focus more on the texture content of the image.
 
@@ -416,106 +655,81 @@ class _ContentLoss(nn.Module):
 
     def __init__(
             self,
-            feature_model_extractor_node: str,
-            feature_model_normalize_mean: list,
-            feature_model_normalize_std: list
+            net_cfg_name: str,
+            batch_norm: bool,
+            num_classes: int,
+            model_weights_path: str,
+            feature_nodes: list,
+            feature_normalize_mean: list,
+            feature_normalize_std: list,
     ) -> None:
-        super(_ContentLoss, self).__init__()
-        # Get the name of the specified feature extraction node
-        self.feature_model_extractor_node = feature_model_extractor_node
-        # Load the VGG19 model trained on the ImageNet dataset.
-        model = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1)
-        # Extract the thirty-sixth layer output in the VGG19 model as the content loss.
-        self.feature_extractor = create_feature_extractor(model, [feature_model_extractor_node])
-        # set to validation mode
-        self.feature_extractor.eval()
-
-        # The preprocessing method of the input data. 
-        # This is the VGG model preprocessing method of the ImageNet dataset.
-        self.normalize = transforms.Normalize(feature_model_normalize_mean, feature_model_normalize_std)
-
-        # Freeze model parameters.
+        super(ContentLoss, self).__init__()
+        # Define the feature extraction model
+        model = _FeatureExtractor(net_cfg_name, batch_norm, num_classes)
+        # Load the pre-trained model
+        if model_weights_path is None:
+            model = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1)
+        elif model_weights_path is not None and os.path.exists(model_weights_path):
+            checkpoint = torch.load(model_weights_path, map_location=lambda storage, loc: storage)
+            if "state_dict" in checkpoint.keys():
+                model.load_state_dict(checkpoint["state_dict"])
+            else:
+                model.load_state_dict(checkpoint)
+        else:
+            raise FileNotFoundError("Model weight file not found")
+        # Extract the output of the feature extraction layer
+        self.feature_extractor = create_feature_extractor(model, feature_nodes)
+        # Select the specified layers as the feature extraction layer
+        self.feature_extractor_nodes = feature_nodes
+        # input normalization
+        self.normalize = transforms.Normalize(feature_normalize_mean, feature_normalize_std)
+        # Freeze model parameters without derivatives
         for model_parameters in self.feature_extractor.parameters():
             model_parameters.requires_grad = False
+        self.feature_extractor.eval()
 
-    def forward(self, sr_tensor: Tensor, gt_tensor: Tensor) -> Tensor:
-        # Standardized operations
+    def forward(self, sr_tensor: Tensor, gt_tensor: Tensor) -> [Tensor]:
+        assert sr_tensor.size() == gt_tensor.size(), "Two tensor must have the same size"
+        device = sr_tensor.device
+
+        losses = []
+        # input normalization
         sr_tensor = self.normalize(sr_tensor)
         gt_tensor = self.normalize(gt_tensor)
 
-        sr_feature = self.feature_extractor(sr_tensor)[self.feature_model_extractor_node]
-        gt_feature = self.feature_extractor(gt_tensor)[self.feature_model_extractor_node]
+        # Get the output of the feature extraction layer
+        sr_feature = self.feature_extractor(sr_tensor)
+        gt_feature = self.feature_extractor(gt_tensor)
 
-        # Find the feature map difference between the two images
-        loss = F_torch.mse_loss(sr_feature, gt_feature)
+        # Compute feature loss
+        for i in range(len(self.feature_extractor_nodes)):
+            losses.append(F_torch.mse_loss(sr_feature[self.feature_extractor_nodes[i]],
+                                           gt_feature[self.feature_extractor_nodes[i]]))
 
-        return loss
+        losses = torch.Tensor([losses]).to(device)
 
-class _GradientLoss(nn.Module):
-    def __init__(self, gp_weight: int , device) -> None:
-        super(_GradientLoss, self).__init__()
-        self.gp_weight = gp_weight
-        self.device = device
+        return losses
 
-    # def forward(self, D:nn.Module, real_samples: Tensor, fake_samples: Tensor) -> Tensor:
-    #     """Calculates the gradient penalty loss for WGAN GP"""
-    #     # Random weight term for interpolation between real and fake samples
-    #     alpha = Tensor(np.random.random((real_samples.size(0), 1, 1, 1))).to(device=config.device, non_blocking=True)
-    #     # Get random interpolation between real and fake samples
-    #     interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
-    #     d_interpolates = D(interpolates)
-    #     fake = Variable(Tensor(real_samples.shape[0], 1, 1, 1).fill_(1.0), requires_grad=False).to(device=config.device, non_blocking=True)
-    #     # Get gradient w.r.t. interpolates
-    #     gradients = autograd.grad(
-    #         outputs=d_interpolates,
-    #         inputs=interpolates,
-    #         grad_outputs=fake,
-    #         create_graph=True,
-    #         retain_graph=True,
-    #         only_inputs=True,
-    #         )[0]
-    #     gradients = gradients.view(gradients.size(0), -1)
-    #     gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
 
-    #     return gradient_penalty
-    
-    def forward(self, D:nn.Module, real_data, generated_data):
-        batch_size = real_data.size()[0]
+def srresnet_x2(**kwargs: Any) -> SRResNet:
+    model = SRResNet(upscale=2, **kwargs)
 
-        # Calculate interpolation
-        alpha = torch.rand(batch_size, 1, 1, 1)
-        alpha = alpha.expand_as(real_data).to(device=self.device, non_blocking=True)
-        interpolated = alpha * real_data.data + (1 - alpha) * generated_data.data
-        interpolated = Variable(interpolated, requires_grad=True).to(device=self.device, non_blocking=True)
+    return model
 
-        # Calculate probability of interpolated examples
-        prob_interpolated = D(interpolated)
-        fake = Variable(Tensor(real_data.shape[0], 1, 1, 1).fill_(1.0), requires_grad=False).to(device=self.device, non_blocking=True)
 
-        # Calculate gradients of probabilities with respect to examples
-        gradients = autograd.grad(outputs=prob_interpolated, 
-                                inputs=interpolated,
-                               grad_outputs=fake,
-                               create_graph=True, 
-                               retain_graph=True)[0]
+def srresnet_x3(**kwargs: Any) -> SRResNet:
+    model = SRResNet(upscale=3, **kwargs)
 
-        # Gradients have shape (batch_size, num_channels, img_width, img_height),
-        # so flatten to easily take norm per example in batch
-        gradients = gradients.view(batch_size, -1)
+    return model
 
-        # Derivatives of the gradient close to 0 can cause problems because of
-        # the square root, so manually calculate norm and add epsilon
-        gradients_norm = torch.sqrt(torch.sum(gradients ** 2, dim=1) + 1e-12)
 
-        # Return gradient penalty
-        return self.gp_weight * ((gradients_norm - 1) ** 2).mean()
-    
-def content_loss(**kwargs) -> _ContentLoss:
-    content_loss = _ContentLoss(**kwargs)
+def srresnet_x4(**kwargs: Any) -> SRResNet:
+    model = SRResNet(upscale=4, **kwargs)
 
-    return content_loss
+    return model
 
-def gradient_loss(gp_weight: int , device: torch.device) -> _GradientLoss:
-    gradient_loss = _GradientLoss(gp_weight, device)
 
-    return gradient_loss
+def discriminator_for_vgg(**kwargs) -> DiscriminatorForVGG:
+    model = DiscriminatorForVGG(**kwargs)
+
+    return model

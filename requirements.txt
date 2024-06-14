@@ -5,3 +5,6 @@ setuptools
 natsort
 tensorboard
 scipy
+lpips
+torchmetrics
+pyYaml

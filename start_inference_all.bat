@@ -1,5 +1,4 @@
 set venv=pytorch
-set exp_name=ensemble_x4-ImageNet_GAN
 
 call %USERPROFILE%\Anaconda3\Scripts\activate %USERPROFILE%\Anaconda3
 call activate %venv%
@@ -11,16 +10,14 @@ call activate %venv%
 :: call %USERPROFILE%/Anaconda3/envs/%venv%/python.exe "%~dp0\main.py"
 :: PAUSE
 
-:: call python inference.py --inputs_path ./figure/comic_lr.png --model_weights_path ./results/%exp_name%/g_best.pth.tar --output_path ./figure/comic_sr_epoches1000.png
+:: call python inference.py --inputs_path ./figure/baboon.png --model_weights_path ./results_epoches1000/SRGAN_x4-DIV2K/g_best.pth.tar --output_path ./figure/comic_sr_epoches1000.png > ./log/result_inference.txt
 
 :: call FOR /L %i IN (1,1,5) DO ECHO %i
 
-call python inference.py --inputs_path ./figure/comic.png --model_weights_path ./results/%exp_name%/g_best.pth.tar --output_path ./figure/comic_sr_epoches_best.png
-
 @echo off
-@REM for /L %%n in (0,1,47) do (echo.> %%n.txt)
-for /L %%n in (59,1,130) do ( 
-    call python inference.py --inputs_path ./figure/comic.png --model_weights_path ./samples/%exp_name%/g_epoch_%%n.pth.tar --output_path ./figure/comic_sr_epoches%%n.png
+@REM for /L %%n in (1,1,47) do (echo.> %%n.txt)
+for /L %%n in (1,1,5) do ( 
+    call python inference.py --inputs ./figure/GOPR0372_07_00_000047.png --model_weights_path ./samples/SRGAN_x4-ImageNet/epoch_%%n.pth.tar --output ./figure/minounet_epoches%%n.png
     )
 
 cmd /k

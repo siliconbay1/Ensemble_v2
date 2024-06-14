@@ -209,5 +209,16 @@ def main() -> None:
          device,
          config)
 
+    # test(
+    #     unet_model: nn.Module,
+    #     ensemble_model: list[nn.Module],
+    #     test_data_prefetcher: CUDAPrefetcher,
+    #     psnr_model: nn.Module,
+    #     ssim_model: nn.Module,
+    #     lpips_model: nn.Module,
+    #     device: torch.device,
+    #     config: Any,
+
+
 if __name__ == "__main__":
     main()
